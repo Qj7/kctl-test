@@ -1,0 +1,1053 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+shopt -s inherit_errexit
+
+DEFAULT_BACKUP_DIR="/var/lib/kctl-transfers"
+TRACKER_ROOT="/var/www/keitaro"
+
+declare -a BG_JOB_PIDS
+declare -A PATHS_TO_FILE_ARCHIVES
+PATHS_TO_FILE_ARCHIVES['redis.tar']='var/lib/redis/dump.rdb'
+PATHS_TO_FILE_ARCHIVES['certs.tar.gz']='etc/letsencrypt/'
+PATHS_TO_FILE_ARCHIVES['nginx.tar.gz']='etc/nginx/conf.d'
+PATHS_TO_FILE_ARCHIVES['tracker.tar.gz']='var/www/keitaro/{application/{filters,macros,redirects},var/bots}'
+PATHS_TO_FILE_ARCHIVES['landing_pages.tar.gz']='var/www/keitaro/lander'
+
+CLICKHOUSE_TABLES=(keitaro_conversions keitaro_clicks schema_migrations)
+MARIADB_BIG_TABLES=(conversions_2 clicks ref_external_ids ref_ips ref_keywords ref_referrers ref_sub_ids visitors)
+
+declare -A TABLE_KEYS
+TABLE_KEYS['conversions_2']='conversion_id'
+TABLE_KEYS['clicks']='click_id'
+TABLE_KEYS['ref_external_ids']='id'
+TABLE_KEYS['ref_ips']='id'
+TABLE_KEYS['ref_keywords']='id'
+TABLE_KEYS['ref_referrers']='id'
+TABLE_KEYS['ref_sub_ids']='id'
+TABLE_KEYS['visitors']='id'
+
+ENGINE_MARIADB='mariadb'
+ENGINE_CLICKHOUSE='clickhouse'
+
+SPLITTING_MODE_BY_ID_RANGE="id range"
+SPLITTING_MODE_BY_PARTITION="partition"
+SPLITTING_MODE_NONE="none"
+
+declare -A SPLITTING_MODES
+SPLITTING_MODES["clickhouse__keitaro_conversions"]="${SPLITTING_MODE_BY_PARTITION}"
+SPLITTING_MODES["clickhouse__keitaro_clicks"]="${SPLITTING_MODE_BY_PARTITION}"
+SPLITTING_MODES["clickhouse__schema_migrations"]="${SPLITTING_MODE_NONE}"
+
+declare -A VARS
+VARS['src__clickhouse_database']="keitaro"
+
+VARS['dst__clickhouse_database']="keitaro"
+VARS['dst__mariadb_database']="keitaro"
+VARS['dst__table_prefix']="keitaro_"
+
+CHUNK_SIZE="1000000"
+CLICKHOUSE_CHUNK_SIZE="100000"
+
+HOST_LOCAL="local"
+
+AS_VERSION__MAX_DIGITS_PER_PART=3
+AS_VERSION__PART_REGEX="[[:digit:]]{1,${AS_VERSION__MAX_DIGITS_PER_PART}}"
+AS_VERSION__PARTS_TO_KEEP=4
+AS_VERSION__REGEX="(${AS_VERSION__PART_REGEX}\.){1,${AS_VERSION__PARTS_TO_KEEP}}"
+
+KCTL_WITH_CH_SUPPORTING_PARTITION_ID="2.36.0"
+
+LOG_LEVEL_TRACE='trace'
+LOG_LEVEL_DEBUG='debug'
+LOG_LEVEL_INFO='info'
+LOG_LEVEL_WARN='warn'
+LOG_LEVEL_ERROR='error'
+LOG_LEVEL_FATAL='fatal'
+
+# shellcheck disable=SC2034
+LOG_LEVELS=(
+  "${LOG_LEVEL_TRACE}"
+  "${LOG_LEVEL_DEBUG}"
+  "${LOG_LEVEL_INFO}"
+  "${LOG_LEVEL_WARN}"
+  "${LOG_LEVEL_ERROR}"
+  "${LOG_LEVEL_FATAL}"
+)
+
+LOGS_TO_KEEP=5
+ROOT_LOG_LEVEL="${LOG_LEVEL:-${LOG_LEVEL_INFO}}"
+FILE_LOG="/var/log/keitaro/kctl-transfers.log"
+FILE_LOG_LEVEL="${FILE_LOG_LEVEL:-${LOG_LEVEL_DEBUG}}"
+LOG_DATATIME_FORMAT="${LOG_DATATIME_FORMAT:-%F %T}"
+
+declare -A LOG_MASKS
+LOG_MASKS['SSHPASS=* sshpass']='SSHPASS=*** sshpass'
+
+init_log() {
+  local log_path="${1}"
+  save_previous_log "${log_path}"
+  delete_old_logs "${log_path}"
+}
+
+save_previous_log() {
+  local log_path="${1}"
+  local previous_log_timestamp
+  if [[ -f "${log_path}" ]]; then
+    previous_log_timestamp=$(date -r "${log_path}" +"%Y%m%d%H%M%S")
+    mv "${log_path}" "${log_path}-${previous_log_timestamp}"
+  fi
+}
+
+delete_old_logs() {
+  local log_filepath="${1}"
+  local log_dir
+  local log_filename
+  log_dir="$(dirname "${log_filepath}")"
+  log_filename="$(basename "${log_filepath}")"
+  /usr/bin/find "${log_dir}" -name "${log_filename}-*" | \
+    /usr/bin/sort | \
+    /usr/bin/head -n -${LOGS_TO_KEEP} | \
+    /usr/bin/xargs rm -f
+}
+
+declare -A LOGGERS
+LOGGERS['root']="/dev/stderr"
+LOGGERS['file']="${FILE_LOG}"
+
+declare -A LOGGER_LOG_LEVELS
+LOGGER_LOG_LEVELS['root']="${ROOT_LOG_LEVEL}"
+LOGGER_LOG_LEVELS['file']="${LOG_LEVEL_TRACE}"
+
+declare -A LOGGER_LOG_FORMATS
+LOGGER_LOG_FORMATS['root']='%message'
+LOGGER_LOG_FORMATS['file']='[%datetime] [%level] %message'
+
+
+logs.is_loggable() {
+  local level="${1}" logger="${2}"
+  local current_int_log_level logger_log_level logger_int_log_level
+
+  current_int_log_level="$(arrays.index_of LOG_LEVELS "${level}")"
+  logger_log_level="${LOGGER_LOG_LEVELS[${logger}]}"
+  logger_int_log_level="$(arrays.index_of LOG_LEVELS "${logger_log_level}")"
+
+  (( current_int_log_level >= logger_int_log_level ))
+}
+
+logs.format_log_line() {
+  local level="${1}" message="${2}" format="${3}" log_line
+
+  log_line="${format}"
+  log_line="${log_line//%level/${level^^}}"
+  log_line="${log_line//%datetime/$(printf "%(${LOG_DATATIME_FORMAT})T")}"
+  log_line="${log_line//%message/${message}}"
+
+  for pattern in "${!LOG_MASKS[@]}"; do
+    substitution="${LOG_MASKS[${pattern}]}"
+    log_line="${log_line//${pattern}/${substitution}}"
+  done
+  echo "${log_line}"
+}
+
+logs.log() {
+  local level="${1}" message="${2}"
+  for logger in "${!LOGGERS[@]}"; do
+    log_filepath="${LOGGERS[${logger}]}"
+    if logs.is_loggable "${level}" "${logger}"; then
+      logs.format_log_line "${level}" "${message}" "${LOGGER_LOG_FORMATS["${logger}"]}" >> "${log_filepath}"
+    fi
+  done
+}
+
+logs.trace() {
+  logs.log "${LOG_LEVEL_TRACE}" "${1}"
+}
+
+logs.debug() {
+  logs.log "${LOG_LEVEL_DEBUG}" "${1}"
+}
+
+logs.info() {
+  logs.log "${LOG_LEVEL_INFO}" "${1}"
+}
+
+logs.warn() {
+  logs.log "${LOG_LEVEL_WARN}" "${1}"
+}
+
+logs.error() {
+  logs.log "${LOG_LEVEL_ERROR}" "${1}"
+}
+
+logs.fatal() {
+  logs.log "${LOG_LEVEL_FATAL}" "${1}"
+}
+
+arrays.index_of() {
+  declare -n array="${1}"
+  local value="${2}"
+  local index=0
+
+  for ((index=0; index<${#array[@]}; index++)); do
+    if [[ "${array[$index]}" == "${value}" ]]; then
+      echo "${index}"
+      break
+    fi
+  done
+}
+
+as_version() {
+  local version_string="${1}"
+  # Expand version string by adding `.` to the end to simplify logic
+  local major_part='0'
+  local minor_part='0'
+  local patch_part='0'
+  local additional_part='0'
+  if [[ "${version_string}." =~ ^${AS_VERSION__REGEX}$ ]]; then
+    IFS='.' read -r -a parts <<< "${version_string}"
+    major_part="${parts[0]:-${major_part}}"
+    minor_part="${parts[1]:-${minor_part}}"
+    patch_part="${parts[2]:-${patch_part}}"
+    additional_part="${parts[3]:-${additional_part}}"
+  fi
+  printf '1%03d%03d%03d%03d' "${major_part}" "${minor_part}" "${patch_part}" "${additional_part}"
+}
+
+
+escape_bash_command() {
+  declare bash_command="${1}"
+  <<< "${bash_command}" sed -e 's/\\/\\\\/g' -e 's/\"/\\\"/g' -e 's/\$/\\\$/g'
+}
+
+run_bash() {
+  local host_key="${1}" bash_command="${2}" load_data_from="${3:-}" save_data_to="${4:-}" log_message result_command
+
+  logs.debug "Running command \`${bash_command}\` on host $(get_host "${host_key}")"
+  bash_command="$(escape_bash_command "${bash_command}")"
+
+  case "${load_data_from}" in
+    '')
+      # empty input, do nothing
+      ;;
+    *.gz)
+      bash_command="$(decompress_command) ${load_data_from} | ${bash_command}"
+      ;;
+    *)
+      bash_command="< ${load_data_from} ${bash_command}"
+      ;;
+  esac
+
+  if [[ "${save_data_to}" =~ \.gz$ ]]; then
+    bash_command="${bash_command} | $(compress_command)"
+  fi
+
+  bash_command="set -eo pipefail; ${bash_command}"
+
+  if [[ "$(get_host "${host_key}")" == "${HOST_LOCAL}" ]]; then
+    result_command="bash -c \"${bash_command}\""
+  else
+    local ssh_command="ssh $(get_host "${host_key}") -o UpdateHostKeys=no -o StrictHostKeyChecking=no"
+    if [[ -v SSH_PASSWORD ]]; then
+      ssh_command="SSHPASS=\"${SSH_PASSWORD}\" sshpass -e ${ssh_command}"
+    elif [[ -v SSH_PATH_TO_KEY ]]; then
+      ssh_command="${ssh_command} -i ${SSH_PATH_TO_KEY}"
+    fi
+    if [[ -v SSH_PORT ]]; then
+      ssh_command="${ssh_command} -p ${SSH_PORT}"
+    fi
+    result_command="${ssh_command} \"${bash_command}\""
+  fi
+
+  if [[ "${save_data_to}" != "" ]]; then
+    result_command="${result_command} > ${save_data_to}"
+  fi
+
+  logs.trace "Running command: \`bash -c \"$(escape_bash_command "${result_command}")\"\`"
+  bash -c "${result_command}"
+}
+
+run_query() {
+  local host_key="${1}" engine="${2}" sql="${3}"; shift 3
+  run_bash "${host_key}" "$(run_query_command "${host_key}" "${engine}" "${sql}")" "${@}"
+}
+
+run_template_query() {
+  local host_key="${1}" engine="${2}" table="${3}" sql="${4}"; shift 4
+  run_bash "${host_key}" "$(run_template_query_command "${host_key}" "${engine}" "${table}" "${sql}")" "${@}"
+}
+
+compress_command() {
+  echo "gzip" 
+}
+
+decompress_command() {
+  echo "zcat" 
+}
+
+stop_certbot_renew() {
+  local host_key="${1}"
+  run_bash "${host_key}" "certbot revoke"
+}
+
+dump_file_archive() {
+  local file_archive_name="${1}" path_to_be_dumped="${2}" path_to_file_archive
+  path_to_file_archive="$(path_to_file_archive "${file_archive_name}")"
+
+  logs.info "Dumping ${path_to_be_dumped} to ${path_to_file_archive}"
+  run_bash 'src' "cd / && tar -c ${path_to_be_dumped}" "" "${path_to_file_archive}" \
+          || ( \
+            logs.info "Dumping ${path_to_be_dumped} to ${path_to_file_archive}. Try #2"
+            run_bash 'src' "cd / && tar -c ${path_to_be_dumped}" "" "${path_to_file_archive}"
+          )
+  logs.info "Successfully dumped ${path_to_be_dumped}"
+}
+
+dump_file_archives() {
+  mkdir -p "$(path_to_file_archives)"
+  for file_archive_name in "${!PATHS_TO_FILE_ARCHIVES[@]}"; do
+    dump_file_archive "${file_archive_name}" "${PATHS_TO_FILE_ARCHIVES["${file_archive_name}"]}"
+  done
+}
+
+fail() {
+  logs.fatal "${1:-}"
+  exit 1
+}
+
+database_name() {
+  local host_key="${1}" engine="${2}"
+
+  echo "${VARS["${host_key}__${engine}_database"]}"
+}
+
+full_table_name() {
+  local host_key="${1}" engine="${2}" table="${3}"
+
+  echo "$(database_name "${host_key}" "${engine}").$(table_name "${host_key}" "${engine}" "${table}")"
+}
+
+table_name() {
+  local host_key="${1}" engine="${2}" table="${3}"
+  if [[ "${engine}" == "${ENGINE_MARIADB}" ]]; then
+    echo "${VARS["${host_key}__table_prefix"]}${table}"
+  else
+    echo "${table}"
+  fi
+}
+
+run_query_command_clickhouse() {
+  local database="${1}" sql="${2}"
+  if [[ "${sql}" == "" ]]; then
+    echo "kctl run clickhouse-query"
+  else
+    echo "kctl run clickhouse-query \"${sql}\""
+  fi
+}
+
+run_query_command_mariadb() {
+  local database="${1}" sql="${2}" 
+  local mysql_command="mysql ${database}"
+
+  if [[ "${sql}" != "" ]]; then
+    mysql_command="${mysql_command} --batch --skip-column-names --default-character-set=utf8"
+    mysql_command="${mysql_command} -e \"${sql}\""
+  fi
+  if [[ "${sql}" =~ ^SELECT ]]; then
+    mysql_command="${mysql_command} | sed -r -e 's/\\bNULL\\b/\\\\N/g'"
+  fi 
+  echo "${mysql_command}" 
+}
+
+run_query_command() {
+  local host_key="${1}" engine="${2}" sql="${3}"
+  local database="$(database_name "${host_key}" "${engine}")"
+  if [[ "${engine}" == "${ENGINE_MARIADB}" ]]; then
+    run_query_command_mariadb "${database}" "${sql}"
+  else
+    run_query_command_clickhouse "${database}" "${sql}"
+  fi
+}
+
+run_template_query_command() {
+  local host_key="${1}" engine="${2}" table="${3}" sql="${4}" table_pk full_table_name
+
+  table_pk="${TABLE_KEYS["${table}"]:-}"
+  full_table_name="$(full_table_name "${host_key}" "${engine}" "${table}")"
+  sql="${sql//\{\{table_pk\}\}/${table_pk}}"
+  sql="${sql//\{\{full_table_name\}\}/${full_table_name}}"
+
+  run_query_command "${host_key}" "${engine}" "${sql}"
+}
+
+remove_unindexed_files() {
+  local engine="${1}" table="${2}"
+  local index_path chunks_path chunk_path
+  index_path="$(path_to_table_chunks_index "${engine}" "${table}")"
+  chunks_path="$(path_to_table_chunks_root "${engine}" "${table}")"
+
+  for chunk_path in "${chunks_path}"/*; do
+    chunk_basename="${chunk_path##*/}"
+    if ! grep -q "${chunk_basename}" "${index_path}"; then
+      logs.trace "removing ${chunk_path}"
+      rm -f "${chunk_path}"
+    fi
+  done
+}
+
+path_to_backup_dir() {
+  echo "${VARS['backup_dir']}"
+}
+
+path_to_file_archives() {
+  echo "$(path_to_backup_dir)/files"
+}
+
+path_to_file_archive() {
+  local file_archive_name="${1}" path_to_file_archive
+
+  path_to_file_archive="$(path_to_file_archives)/${file_archive_name}"
+
+  echo "${path_to_file_archive}"
+}
+
+path_to_inventory_file() {
+  echo "/etc/keitaro/config/inventory"
+}
+
+path_to_tracker_env_file() {
+  echo "/etc/keitaro/config/tracker.env"
+}
+
+get_host() {
+  echo "${VARS["${1}__host"]}"
+}
+
+path_to_saved_tracker_conf() {
+  echo "$(path_to_backup_dir)/src-tracker.env"
+}
+
+path_to_db_dump() {
+  local engine="${1}"
+  echo "$(path_to_backup_dir)/${engine}"
+}
+
+path_to_compressed_tracker_database() {
+  echo "$(path_to_db_dump "${ENGINE_MARIADB}")/tracker.sql.gz"
+}
+
+path_to_table_chunks_root() {
+  local engine="${1}" table="${2}"
+  echo "$(path_to_db_dump "${engine}")/${table}"
+}
+
+path_to_table_chunks_index() {
+  local engine="${1}" table="${2}"
+  echo "$(path_to_db_dump "${engine}")/${table}.index"
+}
+
+path_to_compressed_table_schema() {
+  local engine="${1}" table="${2}"
+  echo "$(path_to_db_dump "${engine}")/${table}.schema.sql.gz"
+}
+
+dump_table_data_chunk() {
+  local engine="${1}" table="${2}" chunk_no="${3}" chunks_count="${4}" name1="${5}" name2="${6}" sql="${7}"
+  local human_no compressed_data_chunk_basename compressed_data_chunk_path
+
+  human_no="$((chunk_no + 1))/${chunks_count}"
+  compressed_data_chunk_basename="$(printf '%07d' "$((chunk_no + 1))")-${name1}-${name2}.tsv.gz"
+  compressed_data_chunk_path="$(path_to_table_chunks_root "${engine}" "${table}")/${compressed_data_chunk_basename}"
+
+  logs.debug "Dumping data chunk ${human_no} of ${engine} table ${table} to ${compressed_data_chunk_path}"
+  if [[ -s "${compressed_data_chunk_path}" ]] && gzip -t "${compressed_data_chunk_path}"; then
+    logs.trace "Skip dumping chunk ${human_no} - already dumped"
+  else
+    run_template_query 'src' "${engine}" "${table}" "${sql}" "" "${compressed_data_chunk_path}"
+    logs.trace "Successfully dumped data chunk ${human_no}"
+  fi
+  echo "${compressed_data_chunk_basename}" >> "$(path_to_table_chunks_index "${engine}" "${table}")"
+}
+
+prepare_dump_file_archive() {
+  local engine="${1}" table="${2}"
+
+  mkdir -p "$(path_to_table_chunks_root "${engine}" "${table}")"
+  echo -n > "$(path_to_table_chunks_index "${engine}" "${table}")"
+}
+
+fix_table_prefix_command() {
+  if [[ "${VARS['src__table_prefix']}" == "${VARS['dst__table_prefix']}" ]]; then
+    echo "cat"
+  else
+    echo "sed 's/\`${VARS['src__table_prefix']}/\`${VARS['dst__table_prefix']}/g'"
+  fi
+}
+
+mysqldump_command() {
+  local mysqldump_args="${1}"
+  if [[ "$(get_var 'src' 'mysqldump_supports_column_statistics')" == "true" ]]; then
+    mysqldump_args="${mysqldump_args} --column-statistics=0"
+  fi
+
+  echo "mysqldump $(database_name 'src' "${ENGINE_MARIADB}") ${mysqldump_args} | $(fix_table_prefix_command)"
+}
+
+dump_table_schema_command() {
+  local engine="${1}" table="${2}" show_create_table_sql show_create_table_command
+
+  show_create_table_sql="SHOW CREATE TABLE {{full_table_name}}"
+  show_create_table_command="$(run_template_query_command 'src' "${engine}" "${table}" "${show_create_table_sql}")"
+  if [[ "${engine}" == "${ENGINE_MARIADB}" ]]; then
+    show_create_table_command="${show_create_table_command} | $(fix_table_prefix_command) | sed -r 's/^\w+\t//g'"
+  fi
+  show_create_table_command="${show_create_table_command} | sed \"s/\\\\\\\\n/\\\\n/g\""
+  echo "${show_create_table_command}"
+}
+
+dump_table_schema() {
+  local engine="${1}" table="${2}" path_to_schema
+  path_to_schema="$(path_to_compressed_table_schema "${engine}" "${table}")"
+
+  logs.info "Dumping ${engine} ${table} schema to ${path_to_schema}"
+  run_bash 'src' "$(dump_table_schema_command "${engine}" "${table}")" "" "${path_to_schema}"
+  logs.debug "Successfully dumped ${engine} ${table} schema"
+}
+
+dump_table_data_unsplitted() {
+  local engine="${1}" table="${2}" rows_count=0 chunk_no=0 chunks_count=1 sql
+
+  rows_count="$(run_template_query 'src' "${engine}" "${table}" "SELECT COUNT(*) FROM {{full_table_name}}")"
+
+  if [[ "${rows_count}" == '0' ]]; then
+    logs.debug "Skip dumping ${engine} ${table} data - table is empty"
+    return
+  fi
+
+  logs.trace "Info ${engine} ${table} - rows: ${rows_count}"
+  sql="SELECT * FROM {{full_table_name}}"
+  dump_table_data_chunk "${engine}" "${table}" "${chunk_no}" "${chunks_count}" "all" "${rows_count}" "${sql}"
+  logs.debug "Successfully dumped ${engine} ${table} data"
+}
+
+to_sql() {
+  local engine="${1}" table="${2}"
+}
+
+dump_table_data_splitted_by_id_range() {
+  local engine="${1}" table="${2}" rows_count=0
+  local min_id max_id chunks_count chunk_no from to sql
+
+  min_id="$(run_template_query 'src' "${engine}" "${table}" "SELECT MIN({{table_pk}}) FROM {{full_table_name}}")"
+
+  if [[ "${min_id}" == '\N' ]]; then
+    logs.debug "Skip dumping ${engine} ${table} data - table is empty"
+    return
+  fi
+
+  max_id="$(run_template_query 'src' "${engine}" "${table}" "SELECT MAX({{table_pk}}) FROM {{full_table_name}}")"
+  rows_count=$(( max_id - min_id + 1 ))
+  chunks_count=$(( (rows_count / CHUNK_SIZE) + 1 ))
+  logs.trace "Info ${engine} ${table} - rows: ${rows_count}, chunks: ${chunks_count}, min_id: ${min_id}, max_id: ${max_id}"
+
+  for ((chunk_no=0; chunk_no<chunks_count; chunk_no++)); do
+    from=$((min_id + chunk_no * CHUNK_SIZE))
+    to=$((from + CHUNK_SIZE - 1))
+    to=$((to > max_id ? max_id : to))
+    sql="SELECT * FROM {{full_table_name}} WHERE {{table_pk}} BETWEEN ${from} AND ${to}"
+    dump_table_data_chunk "${engine}" "${table}" "${chunk_no}" "${chunks_count}" "${from}" "${to}" "${sql}"
+  done
+  logs.debug "Successfully dumped ${engine} ${table} data"
+}
+
+dump_clickhouse_table_data_splitted_by_partition() {
+  local engine="${ENGINE_CLICKHOUSE}" table="${1}" chunk_no=0
+  local full_table partition_ids_with_sum_rows chunks_count sql
+  
+  sql="SELECT partition_id, SUM(rows)"
+  sql="${sql} FROM system.parts"
+  sql="${sql} WHERE database='$(database_name 'src' "${engine}")' AND table='${table}' AND active=1"
+  sql="${sql} GROUP BY partition_id"
+  partition_ids_with_sum_rows="$(run_query 'src' "${engine}" "${sql}")"
+
+  if [[ "${partition_ids_with_sum_rows}" == '' ]]; then
+    logs.debug "Skip dumping ${engine} ${table} data - table is empty"
+    return
+  fi
+
+  chunks_count=$(echo "${partition_ids_with_sum_rows}" | wc -l)
+  logs.trace "Info ${engine} ${table} - chunks_count: ${chunks_count}"
+
+  while read -r partition_id rows_count; do
+    sql="SELECT * FROM {{full_table_name}} WHERE _partition_id = '${partition_id}'"
+    dump_table_data_chunk "${engine}" "${table}" "${chunk_no}" "${chunks_count}" "${partition_id}" "${rows_count}" "${sql}"
+    chunk_no="$((chunk_no + 1))"
+  done <<< "${partition_ids_with_sum_rows}"
+
+  logs.debug "Successfully dumped ${engine} ${table} data"
+}
+
+dump_table_data() {
+  local engine="${1}" table="${2}"
+  local splitting_mode="${SPLITTING_MODES[${engine}__${table}]:-${SPLITTING_MODE_BY_ID_RANGE}}"
+  local dump_root
+
+  dump_root="$(path_to_table_chunks_root "${engine}" "${table}")"
+  logs.info "Dumping ${engine} ${table} data splitted by ${splitting_mode} to ${dump_root}/"
+  prepare_dump_file_archive "${engine}" "${table}"
+  case "${engine}_${splitting_mode}" in
+    "${ENGINE_MARIADB}_${SPLITTING_MODE_BY_ID_RANGE}")
+      dump_table_data_splitted_by_id_range "${engine}" "${table}"
+      ;;
+    "${ENGINE_CLICKHOUSE}_${SPLITTING_MODE_BY_PARTITION}")
+      dump_clickhouse_table_data_splitted_by_partition "${table}"
+      ;;
+    "${ENGINE_CLICKHOUSE}_${SPLITTING_MODE_NONE}")
+      dump_table_data_unsplitted "${engine}" "${table}"
+      ;;
+    *)
+      fail "Unsupported splitting mode '${splitting_mode}' for ${engine} table '${table}'"
+      ;;
+  esac
+
+  remove_unindexed_files "${engine}" "${table}"
+}
+
+dump_tables() {
+  local engine="${1}"; shift
+
+  for table in "${@}"; do
+    dump_table_data "${engine}" "${table}"
+    dump_table_schema "${engine}" "${table}"
+  done
+}
+
+dump_mariadb_tracker_database() {
+  local engine="${ENGINE_MARIADB}" mysqldump_args=""
+
+  logs.info "Dumping tracker ${engine} database to $(path_to_compressed_tracker_database)"
+  for table in "${MARIADB_BIG_TABLES[@]}"; do
+    mysqldump_args="${mysqldump_args} --ignore-table $(full_table_name 'src' "${engine}" "${table}")"
+  done
+  run_bash 'src' "$(mysqldump_command "${mysqldump_args}")" "" "$(path_to_compressed_tracker_database)"
+  logs.debug "Successfully dumped tracker ${engine} database"
+}
+
+dump_mariadb() {
+  dump_tables "${ENGINE_MARIADB}" "${MARIADB_BIG_TABLES[@]}"
+  dump_mariadb_tracker_database
+}
+
+dump_clickhouse() {
+  if need_to_dump_clickhouse; then
+    assert_only_known_tables_in_clickhouse_exist
+    dump_tables "${ENGINE_CLICKHOUSE}" "${CLICKHOUSE_TABLES[@]}"
+  else
+    logs.info "Skip dumping clickhouse tables - source tracker doesn't use clickhouse"
+  fi
+}
+
+print_usage() {
+  echo "Usage: kctl-migrate ACTION HOST [BACKUP_DIR]"
+  echo
+  echo "ACTION"
+  echo "  dump                  - dump Keitaro data from HOST to BACKUP_DIR"
+  echo "  restore               - restore Keitaro data from BACKUP_DIR on the current host"
+  echo "  copy-from             - dump Keitaro data from HOST to BACKUP_DIR and restore it on the current host"
+  echo
+  echo "HOST"
+  echo "  local                 - specify local host"
+  echo "  IP_ADDRESS            - use valid IP address to specify remote host"
+  echo
+  echo "BACKUP_DIR"
+  echo "  Specify Keitaro data directory (default - ${DEFAULT_BACKUP_DIR})"
+  echo
+  echo "Environment variables:"
+  echo "  SSH_PASSWORD          - specify ssh password"
+  echo "  SSH_PORT              - specify ssh port"
+  echo "  SSH_PATH_TO_KEY       - specify path to ssh key"
+  echo
+  echo "Examples:"
+  echo "  SSH_PASSWORD=mypassword kctl-transfer copy-from 1.2.3.4"
+  echo
+}
+
+fail_on_wrong_usage() {
+  print_usage >&2
+  exit 1
+}
+
+unquote() {
+  sed -r -e "s/^'(.*)'\$/\\1/g" -e 's/^"(.*)"$/\1/g'
+}
+
+parse_tracker_config_value() {
+  local host_key="${1}" section="${2}" parameter="${3}"
+  local expression="/^\[${section}\]/ { :l /^${parameter}\s*=/{ s/.*=\s*//; p; q;}; n; b l;}"
+
+  run_bash "${host_key}" "sed -nr \"${expression}\" /var/www/keitaro/application/config/config.ini.php" | unquote
+}
+
+parse_src_kctl_inventory_value() {
+  local host_key="${1}" var_name="${2}" default_value="${3}" grep_command
+
+  grep_command="grep \"^${var_name}=\" $(path_to_inventory_file)"
+  if run_bash "${host_key}" "[[ -f $(path_to_inventory_file) ]] && ${grep_command} --quiet"; then
+    run_bash "${host_key}" "${grep_command} | awk -F= '{ print \$2 }'"
+  else
+    echo "${default_value}"
+  fi
+}
+
+dump_src_tracker_config_variable() {
+  local variable_name="${1}" line_to_be_written
+  line_to_be_written="${variable_name^^}=$(get_var 'src' "${variable_name}")"
+
+  echo "${line_to_be_written}" >> "$(path_to_saved_tracker_conf)"
+  logs.trace "Wrote '${line_to_be_written} to $(path_to_saved_tracker_conf)"
+}
+
+dump_src_tracker_config() {
+  logs.info "Dumping src tracker config to $(path_to_saved_tracker_conf)"
+
+  echo -n > "$(path_to_saved_tracker_conf)"
+
+  dump_src_tracker_config_variable 'salt'
+  dump_src_tracker_config_variable 'postback_key'
+  dump_src_tracker_config_variable 'olap_db'
+  dump_src_tracker_config_variable 'installer_version'
+  dump_src_tracker_config_variable 'landing_pages_dir'
+
+  logs.debug "Successfully dumped src tracker config"
+}
+
+assert_only_known_tables_in_clickhouse_exist() {
+  local sql="SELECT name FROM system.tables WHERE is_temporary = 0 AND database='keitaro' AND engine <> 'MySQL'"
+  local tables table_regex
+  tables="$(run_query 'src' "${ENGINE_CLICKHOUSE}" "${sql}")"
+  while IFS= read -r table; do
+    table_regex="\<${table}\>"
+    if [[ ! "${CLICKHOUSE_TABLES[@]}" =~ ${table_regex} ]]; then
+      fail "ClickHouse database has unknown table ${table}"
+    fi
+  done <<< "${tables}"
+}
+
+assert_can_dump() {
+  local installer_version minimal_kctl_version
+  if need_to_dump_clickhouse; then
+    installer_version="$(as_version "$(get_var 'src' 'installer_version')")"
+    minimal_kctl_version="$(as_version "${KCTL_WITH_CH_SUPPORTING_PARTITION_ID}")"
+
+    logs.trace "installer_version: ${installer_version}, minimal_kctl_version: ${minimal_kctl_version}"
+    if [[ "${installer_version}" -lt "${minimal_kctl_version}" ]]; then
+      fail "Can't dump CH database - please run \`kctl upgrade\` on the $(get_host 'src') host first"
+    fi
+  fi
+}
+
+set_var() {
+  local host_key="${1}" var_name="${2}" var_value="${3}"
+  VARS["${host_key}__${var_name}"]="${var_value}"
+  logs.trace "Got variable from source host - $var_name: ${VARS["src__${var_name}"]}"
+}
+
+get_var() {
+  local host_key="${1}" var_name="${2}"
+  echo "${VARS["${host_key}__${var_name}"]}"
+}
+
+need_to_dump_clickhouse() {
+  [[ "$(get_var 'src' 'olap_db')" == "${ENGINE_CLICKHOUSE}" ]]
+}
+
+need_to_restore_clickhouse() {
+  [[ "${OLAP_DB}" == "${ENGINE_CLICKHOUSE}" ]]
+}
+
+detect_src_tracker_landing_pages_dir() {
+  local sql="SELECT value FROM {{full_table_name}} WHERE {{full_table_name}}.key='lp_dir'"
+  run_template_query 'src' "${ENGINE_MARIADB}" "settings" "${sql}"
+}
+
+detect_src_tracker_license_key() {
+  run_bash 'src' '[[ -f /var/www/keitaro/var/license.key ]] && cat /var/www/keitaro/var/license.key'
+}
+
+gather_facts() {
+  local mariadb_database table_prefix salt postback_key installer_version landing_pages_dir olap_db
+
+  logs.info "Gathering $(get_host 'src') facts"
+
+  mariadb_database="$(parse_tracker_config_value 'src' 'db' 'name')"
+  set_var 'src' 'mariadb_database' "${mariadb_database}"
+
+  table_prefix="$(parse_tracker_config_value 'src' 'db' 'prefix')"
+  set_var 'src' 'table_prefix' "${table_prefix}"
+
+  salt="$(parse_tracker_config_value 'src' 'system' 'salt')"
+  set_var 'src' 'salt' "${salt}"
+
+  postback_key="$(parse_tracker_config_value 'src' 'system' 'postback_key')"
+  set_var 'src' 'postback_key' "${postback_key}"
+
+  installer_version="$(parse_src_kctl_inventory_value 'src' 'installer_version' '0.9')"
+  set_var 'src' 'installer_version' "${installer_version}"
+
+  olap_db="$(parse_src_kctl_inventory_value 'src' 'olap_db' "${ENGINE_MARIADB}")"
+  set_var 'src' 'olap_db' "${olap_db}"
+
+  landing_pages_dir="$(detect_src_tracker_landing_pages_dir)"
+  set_var 'src' 'landing_pages_dir' "${landing_pages_dir}"
+
+  landing_pages_dir="$(detect_src_tracker_landing_pages_dir)"
+  set_var 'src' 'landing_pages_dir' "${landing_pages_dir}"
+
+  PATHS_TO_FILE_ARCHIVES['landing_pages.tar.gz']="var/www/keitaro/${landing_pages_dir}"
+
+  if run_bash 'src' "rpm --query mysql --quiet"; then
+    set_var 'src' 'mysqldump_supports_column_statistics' 'true'
+  else
+    set_var 'src' 'mysqldump_supports_column_statistics' 'false'
+  fi
+
+  logs.debug "Successfully gathered $(get_host 'src') facts"
+}
+
+dump() {
+  VARS['src__host']="${1}"
+  VARS['backup_dir']="${2:-${DEFAULT_BACKUP_DIR}}"
+  mkdir -p "$(path_to_backup_dir)"
+
+  gather_facts
+
+  assert_can_dump
+
+  logs.info "Dumping data from $(get_host 'src') to $(path_to_file_archives)"
+
+  dump_src_tracker_config
+  dump_file_archives
+  dump_mariadb
+  dump_clickhouse
+  logs.info "Successfully dumped all the data"
+}
+
+restore_file_archive() {
+  local archive_name="${1}" path_to_archive_file
+  path_to_archive_file="$(path_to_file_archive ${archive_name})"
+
+  logs.info "Restoring ${archive_name} files from ${path_to_archive_file}"
+  run_bash 'dst' "tar -x -C /" "${path_to_archive_file}"
+  logs.debug "Successfully restored ${archive_name} files"
+}
+
+restore_file_archives() {
+  local archive_name
+  for archive_name in "${!PATHS_TO_FILE_ARCHIVES[@]}"; do
+    restore_file_archive "${archive_name}"
+  done
+}
+
+restore_table_schema() {
+  local engine="${1}" table="${2}" path_to_schema
+
+  path_to_schema="$(path_to_compressed_table_schema "${engine}" "${table}")"
+
+  if [[ -f "${path_to_schema}" ]]; then
+    logs.info "Restoring ${engine} ${table} table schema"
+    run_template_query 'dst' "${engine}" "${table}" "DROP TABLE IF EXISTS {{full_table_name}}"
+    run_query 'dst' "${engine}" "" "${path_to_schema}"
+    logs.debug "Successfully restored ${engine} ${table} table schema"
+  else
+    logs.info "Skip restoring ${engine} ${table} table schema - no schema file presented"
+  fi
+}
+
+list_data_chunks() {
+  local engine="${1}" table="${2}" result=""
+  while read -r file; do
+    result="${result} $(path_to_table_chunks_root "${engine}" "${table}")/${file}"
+  done < "$(path_to_table_chunks_index "${engine}" "${table}")"
+  echo "${result}"
+}
+
+restore_mariadb_table_data() {
+  local engine="${ENGINE_MARIADB}" table="${1}" fifo_path sql
+
+  fifo_path="/var/lib/mysql/$(database_name 'dst' "${engine}")/${table}-fifo"
+  sql="LOAD DATA INFILE '${fifo_path}' INTO TABLE {{full_table_name}} CHARACTER SET UTF8"
+
+  run_bash 'dst' "rm -f '${fifo_path}' && mkfifo --mode=0600 '${fifo_path}' && chown mysql '${fifo_path}'"
+  run_bash 'dst' "$(decompress_command) $(list_data_chunks "${engine}" "${table}") > ${fifo_path}" &
+  run_template_query 'dst' "${engine}" "${table}" "${sql}"
+  run_bash 'dst' "rm -f '${fifo_path}'"
+  logs.debug "Successfully restored the data of ${engine} ${table} table"
+}
+
+restore_clickhouse_table_data() {
+  local engine="${ENGINE_CLICKHOUSE}" table="${1}" sql restore_data_command restore_data_by_chunks_command
+
+  sql="INSERT INTO {{full_table_name}} FORMAT TabSeparated"
+  restore_data_command="$(run_template_query_command 'dst' "${engine}" "${table}" "${sql}")"
+  restore_data_by_chunks_command="split --lines=${CLICKHOUSE_CHUNK_SIZE} --filter '${restore_data_command}'"
+
+  for path_to_data_chunk in "$(list_data_chunks "${engine}" "${table}")"; do
+    run_bash 'dst' "${restore_data_by_chunks_command}" "${path_to_data_chunk}"
+  done
+  logs.debug "Successfully restored the data of ${engine} ${table} table"
+}
+
+restore_tracker_database() {
+  logs.info "Restoring tracker database"
+  run_query 'dst' "${ENGINE_MARIADB}" "" "$(path_to_compressed_tracker_database)"
+  logs.debug "Successfully restored tracker database"
+}
+
+restore_table_data() {
+  local engine="${1}" table="${2}"
+
+  if [[ -s "$(path_to_table_chunks_index "${engine}" "${table}")" ]]; then
+    logs.info "Restoring ${engine} ${table} data from $(path_to_table_chunks_root "${engine}" "${table}")/"
+    restore_${engine}_table_data "${table}"
+  else
+    logs.info "Skip restoring ${engine} ${table} data from $(path_to_table_chunks_root "${engine}" "${table}")/ - directory is empty"
+  fi
+}
+
+restore_table_schemas() {
+  local engine="${1}"; shift
+
+  for table in "${@}"; do
+    restore_table_schema "${engine}" "${table}"
+  done
+}
+
+restore_table_datas_in_bg() {
+  local engine="${1}"; shift
+
+  for table in "${@}"; do
+    restore_table_data "${engine}" "${table}" &
+    BG_JOB_PIDS+=($!)
+  done
+}
+
+set_var_in_file() {
+  local host_key="${1}" path_to_file="${2}" var_name="${3}" var_value="${4}"
+  if run_bash "${host_key}" "grep -q '^${var_name}=' ${path_to_file}"; then
+    run_bash "${host_key}" "sed -i -e 's/^${var_name}=.*/${var_name}=${var_value}/g' '${path_to_file}'"
+  else
+    run_bash "${host_key}" "echo '${var_name}=${var_value}' >> ${path_to_file}"
+  fi
+}
+
+fix_tracker_configs() {
+  set_var_in_file 'dst' "$(path_to_tracker_env_file)" "SALT" "${SALT}"
+  set_var_in_file 'dst' "$(path_to_tracker_env_file)" "POSTBACK_KEY" "${POSTBACK_KEY}"
+
+  set_var_in_file 'dst' "$(path_to_inventory_file)" "olap_db" "${OLAP_DB}"
+  set_var_in_file 'dst' "$(path_to_inventory_file)" "installer_version" "${INSTALLER_VERSION}"
+}
+
+reconfigure_new_tracker() {
+  logs.info "Reconfiguring tracker"
+  fix_tracker_configs
+  run_bash 'dst' "kctl certificates prune all" '' '/dev/null'
+  run_bash 'dst' "kctl tune" '' '/dev/null'
+  logs.debug "Successfully reconfigured tracker"
+}
+
+load_src_tracker_env() {
+  source "$(path_to_saved_tracker_conf)"
+}
+
+assert_backup_valid() {
+  [[ -d "$(path_to_backup_dir)" ]] || fail "Can't find directory $(path_to_backup_dir)"
+  [[ -f "$(path_to_saved_tracker_conf)" ]] || fail "Can't find config $(path_to_saved_tracker_conf)"
+}
+
+dst_tracker_enable_rbooster() {
+  local dst_tracker_olab_db
+
+  if need_to_restore_clickhouse; then
+    dst_tracker_olab_db="$(parse_src_kctl_inventory_value 'dst' 'olap_db' "${ENGINE_MARIADB}")"
+    if [[ "${dst_tracker_olab_db}" != "${ENGINE_CLICKHOUSE}" ]]; then
+      logs.info "Enabling rbooster"
+      run_bash 'dst' 'kctl features enable rbooster' '' '/dev/null'
+      logs.debug "Successfully enabled rbooster"
+    fi
+  fi
+}
+
+dst_tracker_affected_services() {
+  local action="${1}"
+  logs.info "${action}ing redis & cron services"
+  run_bash 'dst' "systemctl ${action} redis"
+  run_bash 'dst' "systemctl ${action} crond"
+}
+
+
+wait_for_bg_jobs_to_complete() {
+  logs.info "Waiting for background data importing jobs to complete"
+  wait "${BG_JOB_PIDS[@]}"
+  logs.info "All the background data importing jobs successfully complete"
+}
+
+restore() {
+  VARS['dst__host']="${1}"
+  VARS['backup_dir']="${2:-${DEFAULT_BACKUP_DIR}}"
+
+  assert_backup_valid
+
+  logs.info "Restoring data from $(path_to_backup_dir)"
+
+  load_src_tracker_env
+
+  stop_certbot_renew
+  dst_tracker_enable_rbooster
+  dst_tracker_affected_services 'stop'
+  restore_file_archives
+  restore_tracker_database
+  restore_table_schemas "${ENGINE_MARIADB}" "${MARIADB_BIG_TABLES[@]}"
+  restore_table_schemas "${ENGINE_CLICKHOUSE}" "${CLICKHOUSE_TABLES[@]}"
+  restore_table_datas_in_bg "${ENGINE_MARIADB}" "${MARIADB_BIG_TABLES[@]}"
+  restore_table_datas_in_bg "${ENGINE_CLICKHOUSE}" "${CLICKHOUSE_TABLES[@]}"
+  wait_for_bg_jobs_to_complete
+  dst_tracker_affected_services 'start'
+  reconfigure_new_tracker
+
+  logs.info "Everything is restored"
+}
+
+copy_from() {
+  local from_host="${1}"
+  dump "${from_host}" "${DEFAULT_BACKUP_DIR}"
+  restore "${HOST_LOCAL}" "${DEFAULT_BACKUP_DIR}"
+  run_bash 'dst' "rm -rf '${DEFAULT_BACKUP_DIR}'"
+}
+
+if [[ "${#}" -lt "2" ]]; then
+  fail_on_wrong_usage
+fi
+
+ACTION="${1}"; shift
+
+case "${ACTION}" in
+  dump)
+    init_log "${FILE_LOG}"
+    dump "${@}"
+    ;;
+  restore)
+    init_log "${FILE_LOG}"
+    restore "${@}"
+    ;;
+  copy-from)
+    init_log "${FILE_LOG}"
+    copy_from "${@}"
+    ;;
+  help)
+    print_usage
+    ;;
+  *)
+    fail_on_wrong_usage
+    ;;
+esac
