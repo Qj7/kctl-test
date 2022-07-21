@@ -286,8 +286,9 @@ decompress_command() {
 }
 
 stop_certbot_renew() {
-  local host_key="${1}"
-  run_bash "${host_key}" "certbot revoke"
+  run_bash 'src' "'systemctl stop crond.service'"
+  run_bash 'src' "docker container rm -f $(docker container ls | grep 'certbot' | awk '{print $1}')"
+  logs.info "Certbot renew stopped"
 }
 
 dump_file_archive() {
@@ -1023,6 +1024,7 @@ copy_from() {
   dump "${from_host}" "${DEFAULT_BACKUP_DIR}"
   restore "${HOST_LOCAL}" "${DEFAULT_BACKUP_DIR}"
   run_bash 'dst' "rm -rf '${DEFAULT_BACKUP_DIR}'"
+  run_bash 'src' 'systemctl start crond.service'
 }
 
 if [[ "${#}" -lt "2" ]]; then
