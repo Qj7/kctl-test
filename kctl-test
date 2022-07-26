@@ -286,8 +286,9 @@ decompress_command() {
 }
 
 stop_certbot_renew() {
-  run_bash 'src' "crontab -l > tmp_crontab | sed -i '/renew/ s/./#&/' tmp_crontab | crontab tmp_crontab | systemctl reload crond.service"
+  run_bash 'src' "crontab -l > tmp_crontab ; sed -i '/renew/ s/./#&/' tmp_crontab | crontab tmp_crontab | systemctl reload crond.service"
   run_bash 'src' "docker container rm -f $(docker container ls | grep 'certbot' | awk '{print $1}')"
+
   logs.info "Certbot renew stopped"
 }
 
